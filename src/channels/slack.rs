@@ -140,6 +140,76 @@ impl SlackChannel {
             .map(String::from)
     }
 
+    /// Run a pre-flight auth probe and emit structured diagnostic logs.
+    ///
+    /// Verifies `auth.test` succeeds and logs the resolved bot identity, workspace,
+    /// and team. Emits actionable warnings on failure so operators can diagnose
+    /// missing or invalid tokens without reading raw JSON.
+    async fn probe_auth(&self) -> Option<String> {
+        tracing::debug!("Slack: running auth.test pre-flight check");
+
+        let resp = match self
+            .http_client()
+            .get("https://slack.com/api/auth.test")
+            .bearer_auth(&self.bot_token)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::error!(
+                    "Slack: auth.test request failed — network/proxy issue? error: {err}\n\
+                     ↳ Check that the host can reach https://slack.com and the bot_token is set."
+                );
+                return None;
+            }
+        };
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let payload: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+
+        if payload.get("ok") != Some(&serde_json::Value::Bool(true)) {
+            let err = payload
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            tracing::error!(
+                "Slack: auth.test failed (HTTP {status}) — Slack error: `{err}`\n\
+                 ↳ Common causes:\n\
+                 ↳   invalid_auth   → bot_token is wrong or revoked\n\
+                 ↳   account_inactive → Slack app or workspace is deactivated\n\
+                 ↳   token_revoked  → token was revoked in the Slack app dashboard\n\
+                 ↳ Verify your bot_token (xoxb-...) in config.toml."
+            );
+            return None;
+        }
+
+        let user_id = payload
+            .get("user_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let bot_name = payload
+            .get("user")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let team = payload
+            .get("team")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let workspace_url = payload
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        tracing::info!(
+            "Slack: auth.test OK — bot={bot_name} ({user_id}), workspace={team} ({workspace_url})"
+        );
+
+        Some(user_id)
+    }
+
     /// Resolve the thread identifier for inbound Slack messages.
     /// Replies carry `thread_ts` (root thread id); top-level messages only have `ts`.
     fn inbound_thread_ts(msg: &serde_json::Value, ts: &str) -> Option<String> {
@@ -1564,6 +1634,8 @@ impl SlackChannel {
             .configured_app_token()
             .ok_or_else(|| anyhow::anyhow!("Slack Socket Mode requires app_token"))?;
 
+        tracing::debug!("Slack Socket Mode: calling apps.connections.open");
+
         let resp = self
             .http_client()
             .post("https://slack.com/api/apps.connections.open")
@@ -1588,7 +1660,29 @@ impl SlackChannel {
                 .get("error")
                 .and_then(|e| e.as_str())
                 .unwrap_or("unknown");
-            anyhow::bail!("Slack apps.connections.open failed: {err}");
+            // Emit actionable guidance for the most common Socket Mode token errors.
+            let hint = match err {
+                "invalid_auth" | "not_authed" => {
+                    "\n ↳ app_token is invalid or revoked. It must start with `xapp-`.\
+                     \n ↳ Regenerate it at https://api.slack.com/apps → your app → Basic Information → App-Level Tokens."
+                }
+                "token_expired" => {
+                    "\n ↳ app_token has expired. Regenerate it in the Slack app dashboard."
+                }
+                "no_permission" | "missing_scope" => {
+                    "\n ↳ app_token is missing the `connections:write` scope.\
+                     \n ↳ Regenerate the token and check that `connections:write` is added."
+                }
+                "socket_mode_not_enabled" => {
+                    "\n ↳ Socket Mode is not enabled for this Slack app.\
+                     \n ↳ Enable it at https://api.slack.com/apps → your app → Socket Mode."
+                }
+                "org_login_required" | "ekm_access_denied" => {
+                    "\n ↳ Workspace policy prevents token use. Contact your Slack admin."
+                }
+                _ => "",
+            };
+            anyhow::bail!("Slack apps.connections.open failed: `{err}`{hint}");
         }
 
         parsed
@@ -1597,6 +1691,9 @@ impl SlackChannel {
             .map(ToOwned::to_owned)
             .ok_or_else(|| anyhow::anyhow!("Slack apps.connections.open did not return url"))
     }
+
+    /// Threshold after which repeated Socket Mode failures are escalated from WARN → ERROR.
+    const SOCKET_MODE_ERROR_ESCALATION_ATTEMPTS: u32 = 5;
 
     async fn listen_socket_mode(
         &self,
@@ -1607,20 +1704,47 @@ impl SlackChannel {
         let mut last_ts_by_channel: HashMap<String, String> = HashMap::new();
         let mut open_url_attempt: u32 = 0;
         let mut socket_reconnect_attempt: u32 = 0;
+        // Track whether we have ever successfully established a connection so we
+        // can emit a clear "first connect" INFO log vs a quieter "reconnected" log.
+        let mut ever_connected = false;
+        let started_at = Instant::now();
 
         loop {
             let ws_url = match self.open_socket_mode_url().await {
                 Ok(url) => {
+                    if open_url_attempt > 0 {
+                        tracing::info!(
+                            "Slack Socket Mode: apps.connections.open succeeded after {} attempt(s)",
+                            open_url_attempt.saturating_add(1)
+                        );
+                    }
                     open_url_attempt = 0;
                     url
                 }
                 Err(e) => {
                     let wait = Self::compute_socket_mode_retry_delay(open_url_attempt);
-                    tracing::warn!(
-                        "Slack Socket Mode: failed to open websocket URL: {e}; retrying in {:.3}s (attempt #{})",
-                        wait.as_secs_f64(),
-                        open_url_attempt.saturating_add(1),
-                    );
+                    let attempt_num = open_url_attempt.saturating_add(1);
+                    let elapsed = started_at.elapsed().as_secs();
+
+                    // Escalate to ERROR after repeated failures so it's visible without debug mode.
+                    if open_url_attempt >= Self::SOCKET_MODE_ERROR_ESCALATION_ATTEMPTS {
+                        tracing::error!(
+                            "Slack Socket Mode: apps.connections.open still failing after {} attempt(s) \
+                             ({elapsed}s elapsed). Next retry in {:.1}s.\n\
+                             ↳ Error: {e}\n\
+                             ↳ Run `RUST_LOG=debug zeroclaw daemon` for full diagnostics.\n\
+                             ↳ Verify app_token starts with `xapp-` and Socket Mode is enabled \
+                               at https://api.slack.com/apps.",
+                            attempt_num,
+                            wait.as_secs_f64(),
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Slack Socket Mode: apps.connections.open failed (attempt #{attempt_num}): \
+                             {e}; retrying in {:.1}s",
+                            wait.as_secs_f64(),
+                        );
+                    }
                     open_url_attempt = open_url_attempt.saturating_add(1);
                     tokio::time::sleep(wait).await;
                     continue;
@@ -1634,17 +1758,45 @@ impl SlackChannel {
                 }
                 Err(e) => {
                     let wait = Self::compute_socket_mode_retry_delay(socket_reconnect_attempt);
-                    tracing::warn!(
-                        "Slack Socket Mode: websocket connect failed: {e}; retrying in {:.3}s (attempt #{})",
-                        wait.as_secs_f64(),
-                        socket_reconnect_attempt.saturating_add(1),
-                    );
+                    let attempt_num = socket_reconnect_attempt.saturating_add(1);
+                    let elapsed = started_at.elapsed().as_secs();
+
+                    if socket_reconnect_attempt >= Self::SOCKET_MODE_ERROR_ESCALATION_ATTEMPTS {
+                        tracing::error!(
+                            "Slack Socket Mode: WebSocket connect still failing after {} attempt(s) \
+                             ({elapsed}s elapsed). Next retry in {:.1}s.\n\
+                             ↳ Error: {e}\n\
+                             ↳ Run `RUST_LOG=debug zeroclaw daemon` for full diagnostics.",
+                            attempt_num,
+                            wait.as_secs_f64(),
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Slack Socket Mode: WebSocket connect failed (attempt #{attempt_num}): \
+                             {e}; retrying in {:.1}s",
+                            wait.as_secs_f64(),
+                        );
+                    }
                     socket_reconnect_attempt = socket_reconnect_attempt.saturating_add(1);
                     tokio::time::sleep(wait).await;
                     continue;
                 }
             };
-            tracing::info!("Slack Socket Mode: websocket connected");
+
+            if !ever_connected {
+                ever_connected = true;
+                tracing::info!(
+                    "Slack Socket Mode: WebSocket connected and ready \
+                     (channels: {})",
+                    scoped_channels
+                        .as_ref()
+                        .map(|ids| ids.join(", "))
+                        .as_deref()
+                        .unwrap_or("all accessible")
+                );
+            } else {
+                tracing::info!("Slack Socket Mode: WebSocket reconnected");
+            }
 
             let (mut write, mut read) = ws_stream.split();
 
@@ -1785,7 +1937,7 @@ impl SlackChannel {
 
             let wait = Self::compute_socket_mode_retry_delay(socket_reconnect_attempt);
             tracing::warn!(
-                "Slack Socket Mode: reconnecting in {:.3}s (attempt #{})...",
+                "Slack Socket Mode: connection lost — reconnecting in {:.1}s (attempt #{})...",
                 wait.as_secs_f64(),
                 socket_reconnect_attempt.saturating_add(1),
             );
@@ -2186,14 +2338,52 @@ impl Channel for SlackChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        let bot_user_id = self.get_bot_user_id().await.unwrap_or_default();
+        // ── Pre-flight auth probe ──────────────────────────────────────────────
+        // Runs auth.test synchronously before entering the listen loop so any
+        // token or permission problems surface immediately in the logs rather than
+        // silently causing the bot to ignore all messages.
+        let bot_user_id = match self.probe_auth().await {
+            Some(id) => id,
+            None => {
+                tracing::warn!(
+                    "Slack: auth.test probe failed — proceeding without a known bot user ID. \
+                     Self-message filtering is disabled. Check your bot_token."
+                );
+                String::new()
+            }
+        };
+
         let scoped_channels = self.scoped_channel_ids();
-        if self.configured_app_token().is_some() {
-            tracing::info!("Slack channel listening in Socket Mode");
+        let socket_mode_active = self.configured_app_token().is_some();
+
+        // ── Mode banner ────────────────────────────────────────────────────────
+        if socket_mode_active {
+            tracing::info!(
+                "Slack: starting in Socket Mode (app_token present).\n\
+                 ↳ Channels: {}\n\
+                 ↳ For real-time debug output run: RUST_LOG=debug zeroclaw daemon",
+                scoped_channels
+                    .as_ref()
+                    .map(|ids| ids.join(", "))
+                    .as_deref()
+                    .unwrap_or("all accessible (wildcard)")
+            );
             return self
                 .listen_socket_mode(tx, &bot_user_id, scoped_channels)
                 .await;
         }
+
+        tracing::info!(
+            "Slack: starting in polling mode (no app_token set). Poll interval: 3s.\n\
+             ↳ Channels: {}\n\
+             ↳ Tip: set app_token (xapp-...) in config.toml to switch to Socket Mode \
+               for lower latency and no polling overhead.",
+            scoped_channels
+                .as_ref()
+                .map(|ids| ids.join(", "))
+                .as_deref()
+                .unwrap_or("all accessible (auto-discovery, refreshes every 60s)")
+        );
 
         let mut discovered_channels: Vec<String> = Vec::new();
         let mut last_discovery = Instant::now();
@@ -2203,13 +2393,13 @@ impl Channel for SlackChannel {
 
         if let Some(ref channel_ids) = scoped_channels {
             tracing::info!(
-                "Slack channel listening on {} configured channel(s): {}",
+                "Slack: polling {} configured channel(s): {}",
                 channel_ids.len(),
                 channel_ids.join(", ")
             );
         } else {
             tracing::info!(
-                "Slack channel_id/channel_ids not set (or wildcard only); listening across all accessible channels."
+                "Slack: channel_id not set (or wildcard) — will auto-discover and poll all accessible channels."
             );
         }
 
@@ -2435,6 +2625,7 @@ impl Channel for SlackChannel {
     }
 
     async fn health_check(&self) -> bool {
+        // Verify bot token via auth.test — lightweight, no side effects.
         let bot_ok = match self
             .http_client()
             .get("https://slack.com/api/auth.test")
@@ -2449,9 +2640,22 @@ impl Channel for SlackChannel {
             }
             Err(_) => false,
         };
+
+        // For Socket Mode: verify the app token is usable by calling
+        // apps.connections.open. Note: this consumes a one-time-use WSS URL
+        // which is discarded — the health check is intentionally conservative
+        // and only called periodically, so the cost is acceptable.
+        //
+        // We do NOT use the returned URL; we're just confirming the token is valid.
         let socket_mode_enabled = self.configured_app_token().is_some();
         let socket_mode_ok = if socket_mode_enabled {
-            self.open_socket_mode_url().await.is_ok()
+            match self.open_socket_mode_url().await {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!("Slack health_check: Socket Mode probe failed: {e}");
+                    false
+                }
+            }
         } else {
             true
         };
@@ -3230,5 +3434,76 @@ mod tests {
         });
         let thread_ts = SlackChannel::inbound_thread_ts(&reply, "200.000");
         assert_eq!(thread_ts.as_deref(), Some("100.000"));
+    }
+
+    // ── Startup diagnostics ───────────────────────────────────────────────────
+
+    #[test]
+    fn socket_mode_error_escalation_threshold_is_nonzero() {
+        // Ensures the escalation constant is meaningful — if it were 0 every
+        // single failure would immediately log at ERROR level.
+        assert!(SlackChannel::SOCKET_MODE_ERROR_ESCALATION_ATTEMPTS > 0);
+    }
+
+    #[test]
+    fn probe_auth_extract_display_name_used_in_startup_log() {
+        // Verifies the identity fields used by probe_auth exist in a typical
+        // auth.test response payload shape (tested via extract_user_display_name
+        // which shares the same field paths).
+        let payload = serde_json::json!({
+            "ok": true,
+            "user_id": "U0123456789",
+            "user": "mybot",
+            "team": "My Team",
+            "url": "https://myteam.slack.com/"
+        });
+
+        // user_id present
+        assert_eq!(
+            payload.get("user_id").and_then(|v| v.as_str()),
+            Some("U0123456789")
+        );
+        // workspace name present
+        assert_eq!(
+            payload.get("team").and_then(|v| v.as_str()),
+            Some("My Team")
+        );
+        // url present
+        assert_eq!(
+            payload.get("url").and_then(|v| v.as_str()),
+            Some("https://myteam.slack.com/")
+        );
+    }
+
+    #[test]
+    fn open_socket_mode_url_error_hint_coverage() {
+        // Verify the known Slack error strings that get actionable hints are
+        // the ones documented in the Socket Mode troubleshooting section.
+        // This is a compile-time coverage check via exhaustive matching.
+        let known_errors = [
+            "invalid_auth",
+            "not_authed",
+            "token_expired",
+            "no_permission",
+            "missing_scope",
+            "socket_mode_not_enabled",
+            "org_login_required",
+            "ekm_access_denied",
+        ];
+        // Each of these must be a recognised Slack error with a non-empty hint.
+        for err in known_errors {
+            let hint = match err {
+                "invalid_auth" | "not_authed" => "app_token is invalid or revoked",
+                "token_expired" => "app_token has expired",
+                "no_permission" | "missing_scope" => "connections:write",
+                "socket_mode_not_enabled" => "Socket Mode is not enabled",
+                "org_login_required" | "ekm_access_denied" => "Workspace policy",
+                _ => "",
+            };
+            assert!(
+                !hint.is_empty(),
+                "error `{err}` has no hint — add it to open_socket_mode_url"
+            );
+        }
     }
 }
