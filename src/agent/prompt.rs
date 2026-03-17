@@ -1,5 +1,6 @@
 use crate::config::IdentityConfig;
 use crate::identity;
+use crate::learnings::{self, Learning, LearningScope};
 use crate::skills::Skill;
 use crate::tools::Tool;
 use anyhow::Result;
@@ -17,6 +18,11 @@ pub struct PromptContext<'a> {
     pub skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     pub identity_config: Option<&'a IdentityConfig>,
     pub dispatcher_instructions: &'a str,
+    /// All learnings loaded for this workspace.
+    pub learnings: &'a [Learning],
+    /// Channel identifier for the current inbound message, e.g. `"slack:#sct-internal-dev"`.
+    /// Used to select channel-scoped learnings at prompt-build time.
+    pub active_channel: Option<&'a str>,
 }
 
 pub trait PromptSection: Send + Sync {
@@ -37,6 +43,12 @@ impl SystemPromptBuilder {
                 Box::new(ToolsSection),
                 Box::new(SafetySection),
                 Box::new(SkillsSection),
+                // Global learnings injected after skills so the model sees them
+                // in the same "instructions" cluster.
+                Box::new(GlobalLearningsSection),
+                // Channel-scoped learnings come just before the datetime/runtime
+                // tail so they read as fresh context, not permanent identity.
+                Box::new(ChannelLearningsSection),
                 Box::new(WorkspaceSection),
                 Box::new(DateTimeSection),
                 Box::new(RuntimeSection),
@@ -68,6 +80,8 @@ pub struct IdentitySection;
 pub struct ToolsSection;
 pub struct SafetySection;
 pub struct SkillsSection;
+pub struct GlobalLearningsSection;
+pub struct ChannelLearningsSection;
 pub struct WorkspaceSection;
 pub struct RuntimeSection;
 pub struct DateTimeSection;
@@ -161,6 +175,35 @@ impl PromptSection for SkillsSection {
             ctx.workspace_dir,
             ctx.skills_prompt_mode,
         ))
+    }
+}
+
+impl PromptSection for GlobalLearningsSection {
+    fn name(&self) -> &str {
+        "global_learnings"
+    }
+
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        let global = learnings::global_learnings(ctx.learnings);
+        Ok(learnings::learnings_to_prompt(&global, "Behavioral Learnings"))
+    }
+}
+
+impl PromptSection for ChannelLearningsSection {
+    fn name(&self) -> &str {
+        "channel_learnings"
+    }
+
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        let channel = learnings::learnings_for_channel(ctx.learnings, ctx.active_channel);
+        if channel.is_empty() {
+            return Ok(String::new());
+        }
+        let header = match ctx.active_channel {
+            Some(id) => format!("Channel Context ({id})"),
+            None => "Channel Context".into(),
+        };
+        Ok(learnings::learnings_to_prompt(&channel, &header))
     }
 }
 
@@ -317,6 +360,8 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: Some(&identity_config),
             dispatcher_instructions: "",
+            learnings: &[],
+            active_channel: None,
         };
 
         let section = IdentitySection;
@@ -345,6 +390,8 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "instr",
+            learnings: &[],
+            active_channel: None,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Tools"));
@@ -380,6 +427,8 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
+            learnings: &[],
+            active_channel: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -418,6 +467,8 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Compact,
             identity_config: None,
             dispatcher_instructions: "",
+            learnings: &[],
+            active_channel: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -439,6 +490,8 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "instr",
+            learnings: &[],
+            active_channel: None,
         };
 
         let rendered = DateTimeSection.build(&ctx).unwrap();
@@ -477,6 +530,8 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
+            learnings: &[],
+            active_channel: None,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();

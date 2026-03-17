@@ -3828,6 +3828,18 @@ pub async fn start_channels(config: Config) -> Result<()> {
                     config.hooks.builtin.webhook_audit.clone(),
                 )));
             }
+            // Register the learnings hook handler when learnings are enabled.
+            // It holds an Arc<LearningsStore> backed by the same watcher that
+            // the agent uses, so hook-scoped learnings are always current.
+            if config.learnings.enabled {
+                let store = Arc::new(crate::learnings::LearningsStore::new(
+                    &config.workspace_dir,
+                ));
+                Arc::clone(&store).spawn_watcher(5);
+                runner.register(Box::new(
+                    crate::hooks::builtin::LearningsHookHandler::new(store),
+                ));
+            }
             Some(Arc::new(runner))
         } else {
             None

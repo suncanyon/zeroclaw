@@ -144,6 +144,10 @@ pub struct Config {
     #[serde(default)]
     pub skills: SkillsConfig,
 
+    /// Learnings — soft behavioral rules scoped to global/skill/channel/hook (`[learnings]`).
+    #[serde(default)]
+    pub learnings: LearningsConfig,
+
     /// Model routing rules — route `hint:<name>` to specific provider+model combos.
     #[serde(default)]
     pub model_routes: Vec<ModelRouteConfig>,
@@ -879,6 +883,22 @@ pub struct SkillsConfig {
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
+}
+
+/// Learnings configuration (`[learnings]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct LearningsConfig {
+    /// Whether learnings are loaded and injected. Default: `true`.
+    #[serde(default = "default_learnings_enabled")]
+    pub enabled: bool,
+    /// Override the learnings directory path.
+    /// Defaults to `<workspace>/learnings/`.
+    #[serde(default)]
+    pub dir: Option<String>,
+}
+
+fn default_learnings_enabled() -> bool {
+    true
 }
 
 /// Multimodal (image) handling configuration (`[multimodal]` section).
