@@ -179,15 +179,111 @@ mention_only = false
 ```toml
 [channels_config.slack]
 bot_token = "xoxb-..."
-app_token = "xapp-..."             # optional
+app_token = "xapp-..."             # optional — enables Socket Mode (recommended)
 channel_id = "C1234567890"         # optional: single channel; omit or "*" for all accessible channels
 allowed_users = ["*"]
 ```
 
-Slack listen behavior:
+#### Listen modes
+
+Zeroclaw picks the listen mode automatically based on whether `app_token` is set:
+
+| Mode | Condition | Latency | Notes |
+|------|-----------|---------|-------|
+| **Socket Mode** | `app_token` set | ~instant | Recommended for production. Requires Socket Mode enabled in Slack app settings + `connections:write` scope on the app token. |
+| **Polling** | no `app_token` | ~3 s | Falls back to `conversations.history` polling every 3 seconds. Simpler to set up, but higher latency. |
+
+When the daemon starts it logs the active mode clearly at `INFO` level:
+
+```
+Slack: starting in Socket Mode (app_token present).
+```
+or:
+```
+Slack: starting in polling mode (no app_token set).
+```
+
+If you don't see either message, auth failed — check logs for `auth.test` errors.
+
+#### Channel scoping
 
 - `channel_id = "C123..."`: listen only on that channel.
-- `channel_id = "*"` or omitted: auto-discover and listen across all accessible channels.
+- `channel_id = "*"` or omitted: auto-discover and listen across all accessible channels (refreshes every 60 s).
+
+#### Required OAuth bot token scopes
+
+| Scope | Required for |
+|-------|-------------|
+| `channels:history` | Reading public channel messages |
+| `groups:history` | Reading private channel messages |
+| `im:history` | Reading DM messages |
+| `mpim:history` | Reading multi-party DM messages |
+| `channels:read` | Channel discovery (wildcard mode) |
+| `groups:read` | Private channel discovery |
+| `users:read` | Resolving sender display names |
+| `chat:write` | Sending replies |
+
+For Socket Mode, the **app-level token** (xapp-...) also needs the `connections:write` scope.
+
+#### Troubleshooting Slack
+
+**Getting debug-level output**
+
+Run the daemon in the foreground with debug logging:
+
+```bash
+# Via CLI flag (no env var needed)
+zeroclaw daemon --log-level debug
+
+# Or via RUST_LOG env var
+RUST_LOG=debug zeroclaw daemon
+
+# For just Slack channel debug output, scoped to reduce noise
+RUST_LOG=zeroclaw::channels::slack=debug zeroclaw daemon
+```
+
+**Service logs** (when running as a background service)
+
+```bash
+# systemd user service
+journalctl --user -u zeroclaw.service -f
+
+# launchd (macOS)
+tail -f ~/Library/Logs/zeroclaw/daemon.stdout.log
+
+# OpenRC
+tail -f /var/log/zeroclaw/error.log
+```
+
+**Common errors and fixes**
+
+| Log message | Cause | Fix |
+|-------------|-------|-----|
+| `auth.test failed … invalid_auth` | `bot_token` is wrong or revoked | Regenerate a bot token (xoxb-...) in Slack app dashboard |
+| `apps.connections.open failed: socket_mode_not_enabled` | Socket Mode not turned on | Enable Socket Mode at https://api.slack.com/apps → your app → Socket Mode |
+| `apps.connections.open failed: no_permission` or `missing_scope` | `app_token` missing `connections:write` | Regenerate app token and add `connections:write` scope |
+| `apps.connections.open failed: invalid_auth` | `app_token` is wrong or revoked | Ensure token starts with `xapp-`; regenerate in app dashboard |
+| No messages received, no errors | `allowed_users` empty or wrong | Set `allowed_users = ["*"]` or add specific Slack user IDs |
+| Bot not responding in channels | `mention_only` behaviour | Bot responds to DMs always; in group channels, @mention the bot |
+| Service starts then goes silent | Socket Mode reconnect loop | Check logs — may be backing off; wait for `ERROR` escalation at attempt #5+ |
+
+**Checking if Socket Mode is actually active**
+
+Look for this in the startup logs:
+
+```
+Slack: auth.test OK — bot=mybot (U0123456789), workspace=My Team (https://myteam.slack.com/)
+Slack: starting in Socket Mode (app_token present).
+Slack Socket Mode: WebSocket connected and ready (channels: C0123456789)
+```
+
+If you see `polling mode` instead of `Socket Mode`, `app_token` is missing or empty in your config.
+
+**Checking config without restarting**
+
+```bash
+zeroclaw doctor
+```
 
 ### 4.4 Mattermost
 

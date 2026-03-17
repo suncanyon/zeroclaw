@@ -150,6 +150,12 @@ struct Cli {
     #[arg(long, global = true)]
     config_dir: Option<String>,
 
+    /// Log verbosity level: error, warn, info (default), debug, trace.
+    /// Overrides the RUST_LOG environment variable when set.
+    /// Use `--log-level debug` to troubleshoot channel connectivity issues.
+    #[arg(long, global = true, value_name = "LEVEL")]
+    log_level: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -710,11 +716,27 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Initialize logging - respects RUST_LOG env var, defaults to INFO
+    // Initialize logging.
+    // Priority: --log-level flag > RUST_LOG env var > default (info).
+    let log_filter = if let Some(ref level) = cli.log_level {
+        // Validate early so the user gets a clear error before anything else runs.
+        match level.to_lowercase().as_str() {
+            "error" | "warn" | "info" | "debug" | "trace" => {}
+
+            other => {
+                eprintln!(
+                    "error: invalid --log-level `{other}`. \
+                     Valid values: error, warn, info, debug, trace."
+                );
+                std::process::exit(1);
+            }
+        }
+        EnvFilter::new(level.to_lowercase())
+    } else {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+    };
     let subscriber = fmt::Subscriber::builder()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(log_filter)
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
