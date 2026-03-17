@@ -140,8 +140,39 @@ New module parallel to `src/skills/` and `src/sop/`:
 ```
 src/learnings/
   mod.rs        ← load_learnings(), filter helpers, learnings_to_prompt()
+  store.rs      ← LearningsStore — live-reloading Arc<RwLock<Vec<Learning>>>
   types.rs      ← Learning, LearningScope, LearningManifest
 ```
+
+#### Dynamic Store (`LearningsStore`)
+
+Learnings are **not** configured in the primary config file — that would require the agent to edit its own config to add new rules, and would require a restart. Instead, the store is backed by the `<workspace>/learnings/` directory and reloads automatically:
+
+```rust
+pub struct LearningsStore {
+    inner: Arc<RwLock<Vec<Learning>>>,
+    dir: PathBuf,
+}
+
+impl LearningsStore {
+    // Load from workspace_dir/learnings/ at construction time
+    pub fn new(workspace_dir: &Path) -> Self;
+
+    // Return a point-in-time snapshot (lock held briefly)
+    pub fn snapshot(&self) -> Vec<Learning>;
+
+    // Force-reload from disk (also called by the watcher on change)
+    pub fn reload(&self);
+
+    // Spawn a background tokio task that polls every N seconds
+    pub fn spawn_watcher(self: Arc<Self>, interval_secs: u64);
+
+    // Write a Learning to disk as LEARNING.toml + immediately reload
+    pub fn write_learning(&self, learning: &Learning) -> Result<()>;
+}
+```
+
+**Key property:** When an agent writes a new `LEARNING.toml` (e.g. via `write_learning()` or the `file_write` tool), the background watcher picks it up within the next poll interval and the new rules become active on the *next prompt build* — **no restart required**.
 
 **Key types:**
 
@@ -192,9 +223,14 @@ Two new `PromptSection` implementations are added to `SystemPromptBuilder::with_
 
 ### 4.3 Hook Injection — `src/hooks/builtin/learnings.rs`
 
-`LearningsHookHandler` implements `HookHandler` with `priority = -10` (runs after standard hooks):
+`LearningsHookHandler` implements `HookHandler` with `priority = -10` (runs after standard hooks).
+It holds an `Arc<LearningsStore>` so it always reads the *current* learnings on each invocation:
 
 ```rust
+pub struct LearningsHookHandler {
+    store: Arc<LearningsStore>,
+}
+
 // Appends hook:before_prompt_build learnings to the assembled prompt string
 async fn before_prompt_build(&self, mut prompt: String) -> HookResult<String>
 
@@ -202,7 +238,9 @@ async fn before_prompt_build(&self, mut prompt: String) -> HookResult<String>
 async fn before_tool_call(&self, name: String, args: Value) -> HookResult<(String, Value)>
 ```
 
-The handler is registered in the `HookRunner` at agent startup when learnings are present.
+The handler is registered in the `HookRunner` at agent startup when learnings are enabled.
+Because `before_prompt_build` calls `self.store.snapshot()` on every invocation, newly-added
+hook-scoped learnings take effect immediately without restarting the agent.
 
 ### 4.4 Config — `src/config/schema.rs`
 
@@ -216,11 +254,11 @@ dir     = "~/custom/learnings"  # default: <workspace>/learnings/
 
 ### 4.5 Agent Wiring — `src/agent/agent.rs`
 
-- `Agent` struct gains `learnings: Vec<Learning>`
-- `AgentBuilder` gains `.learnings(Vec<Learning>)` setter
+- `Agent` struct holds `learnings: Arc<LearningsStore>` (not a static `Vec`)
+- `AgentBuilder` gains `.learnings(Arc<LearningsStore>)` setter
+- `Agent::from_config()` constructs the store from `config.workspace_dir`, then calls `store.spawn_watcher(5)` to enable live reload
 - `build_system_prompt()` delegates to `build_system_prompt_with_channel(None)`
-- New `build_system_prompt_with_channel(active_channel: Option<&str>)` passes `active_channel` + `learnings` into `PromptContext`
-- The gateway / daemon request path passes the inbound channel identifier when calling `build_system_prompt_with_channel`
+- `build_system_prompt_with_channel` calls `self.learnings.snapshot()` to get a fresh copy of learnings for the current prompt build
 
 ---
 

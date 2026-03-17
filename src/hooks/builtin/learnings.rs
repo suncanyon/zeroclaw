@@ -17,27 +17,39 @@
 //! can react to dynamic state: which skills were activated, which channel the
 //! current message came from, etc.  The hook approach also lets operators
 //! override or disable learnings injection without forking the agent core.
+//!
+//! ## Dynamic reload
+//!
+//! The handler holds an `Arc<LearningsStore>` rather than a static
+//! `Vec<Learning>`.  On every hook invocation it calls `store.snapshot()` to
+//! get the *current* learnings, so any LEARNING.toml files added or modified
+//! on disk (and picked up by the store's background watcher) take effect
+//! immediately — no agent restart required.
 
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 
 use crate::hooks::traits::{HookHandler, HookResult};
-use crate::learnings::{self, Learning};
+use crate::learnings::{self, LearningsStore};
 
 pub struct LearningsHookHandler {
-    learnings: Arc<Vec<Learning>>,
+    store: Arc<LearningsStore>,
 }
 
 impl LearningsHookHandler {
-    pub fn new(learnings: Vec<Learning>) -> Self {
-        Self {
-            learnings: Arc::new(learnings),
-        }
+    /// Create a handler backed by a live [`LearningsStore`].
+    ///
+    /// The store should already have its watcher running (via
+    /// [`LearningsStore::spawn_watcher`]) so that hook injections stay current
+    /// without an agent restart.
+    pub fn new(store: Arc<LearningsStore>) -> Self {
+        Self { store }
     }
 
     fn hook_rules_block(&self, hook_name: &str) -> String {
-        let matched = learnings::learnings_for_hook(&self.learnings, hook_name);
+        let snapshot = self.store.snapshot();
+        let matched = learnings::learnings_for_hook(&snapshot, hook_name);
         learnings::learnings_to_prompt(&matched, &format!("Learnings ({hook_name})"))
     }
 }
@@ -81,10 +93,15 @@ impl HookHandler for LearningsHookHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::learnings::{Learning, LearningScope};
+    use crate::learnings::{Learning, LearningScope, LearningsStore};
+    use std::sync::Arc;
 
-    fn make_hook_learning(hook: &str) -> Learning {
-        Learning {
+    fn make_store_with_hook_learning(
+        tmp: &tempfile::TempDir,
+        hook: &str,
+    ) -> Arc<LearningsStore> {
+        let store = Arc::new(LearningsStore::new(tmp.path()));
+        let learning = Learning {
             name: format!("hook-{hook}"),
             description: "hook rule".into(),
             version: "0.1.0".into(),
@@ -95,13 +112,16 @@ mod tests {
             }],
             rules: vec![format!("Rule for {hook}.")],
             location: None,
-        }
+        };
+        store.write_learning(&learning).unwrap();
+        store
     }
 
     #[tokio::test]
     async fn appends_hook_learnings_to_prompt() {
-        let learning = make_hook_learning("before_prompt_build");
-        let handler = LearningsHookHandler::new(vec![learning]);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store_with_hook_learning(&tmp, "before_prompt_build");
+        let handler = LearningsHookHandler::new(store);
 
         let base = "## System\n\nYou are an agent.".to_string();
         match handler.before_prompt_build(base.clone()).await {
@@ -115,8 +135,9 @@ mod tests {
 
     #[tokio::test]
     async fn no_op_when_no_hook_learnings() {
-        let learning = make_hook_learning("some_other_hook");
-        let handler = LearningsHookHandler::new(vec![learning]);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store_with_hook_learning(&tmp, "some_other_hook");
+        let handler = LearningsHookHandler::new(store);
 
         let base = "## System\n\nYou are an agent.".to_string();
         match handler.before_prompt_build(base.clone()).await {
@@ -127,12 +148,54 @@ mod tests {
 
     #[tokio::test]
     async fn before_tool_call_passes_through() {
-        let handler = LearningsHookHandler::new(vec![]);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LearningsStore::new(tmp.path()));
+        let handler = LearningsHookHandler::new(store);
         match handler
             .before_tool_call("shell".into(), serde_json::json!({"cmd": "ls"}))
             .await
         {
             HookResult::Continue((name, _)) => assert_eq!(name, "shell"),
+            HookResult::Cancel(_) => panic!("should not cancel"),
+        }
+    }
+
+    #[tokio::test]
+    async fn picks_up_new_learnings_after_reload() {
+        // Demonstrate that adding a learning to the store while the handler is
+        // running takes effect without constructing a new handler.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LearningsStore::new(tmp.path()));
+        let handler = LearningsHookHandler::new(Arc::clone(&store));
+
+        let base = "## System".to_string();
+
+        // Initially no learnings — should be a no-op.
+        match handler.before_prompt_build(base.clone()).await {
+            HookResult::Continue(result) => assert_eq!(result, base),
+            HookResult::Cancel(_) => panic!("should not cancel"),
+        }
+
+        // Now add a hook-scoped learning directly to the store.
+        let new_learning = Learning {
+            name: "dynamic-rule".into(),
+            description: "added at runtime".into(),
+            version: "0.1.0".into(),
+            author: None,
+            tags: vec![],
+            scopes: vec![LearningScope::Hook {
+                hook: "before_prompt_build".into(),
+            }],
+            rules: vec!["Dynamic runtime rule.".into()],
+            location: None,
+        };
+        store.write_learning(&new_learning).unwrap();
+
+        // Same handler — should now see the new learning.
+        match handler.before_prompt_build(base.clone()).await {
+            HookResult::Continue(result) => {
+                assert!(result.contains("Dynamic runtime rule."), "expected dynamic rule in prompt");
+            }
             HookResult::Cancel(_) => panic!("should not cancel"),
         }
     }

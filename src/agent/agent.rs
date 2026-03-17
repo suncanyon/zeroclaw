@@ -32,7 +32,7 @@ pub struct Agent {
     identity_config: crate::config::IdentityConfig,
     skills: Vec<crate::skills::Skill>,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
-    learnings: Vec<crate::learnings::Learning>,
+    learnings: Arc<crate::learnings::LearningsStore>,
     auto_save: bool,
     history: Vec<ConversationMessage>,
     classification_config: crate::config::QueryClassificationConfig,
@@ -55,7 +55,7 @@ pub struct AgentBuilder {
     identity_config: Option<crate::config::IdentityConfig>,
     skills: Option<Vec<crate::skills::Skill>>,
     skills_prompt_mode: Option<crate::config::SkillsPromptInjectionMode>,
-    learnings: Option<Vec<crate::learnings::Learning>>,
+    learnings: Option<Arc<crate::learnings::LearningsStore>>,
     auto_save: Option<bool>,
     classification_config: Option<crate::config::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
@@ -160,7 +160,7 @@ impl AgentBuilder {
         self
     }
 
-    pub fn learnings(mut self, learnings: Vec<crate::learnings::Learning>) -> Self {
+    pub fn learnings(mut self, learnings: Arc<crate::learnings::LearningsStore>) -> Self {
         self.learnings = Some(learnings);
         self
     }
@@ -226,7 +226,11 @@ impl AgentBuilder {
             identity_config: self.identity_config.unwrap_or_default(),
             skills: self.skills.unwrap_or_default(),
             skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
-            learnings: self.learnings.unwrap_or_default(),
+            learnings: self.learnings.unwrap_or_else(|| {
+                Arc::new(crate::learnings::LearningsStore::from_dir(
+                    std::path::PathBuf::from(".").join("learnings"),
+                ))
+            }),
             auto_save: self.auto_save.unwrap_or(false),
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
@@ -351,6 +355,19 @@ impl Agent {
             ))
             .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
+            .learnings({
+                // Build the learnings store from the workspace directory.
+                // The store's background watcher is started here so that any
+                // LEARNING.toml files written by the agent (or the operator)
+                // are picked up without restarting the process.
+                let store = Arc::new(crate::learnings::LearningsStore::new(
+                    &config.workspace_dir,
+                ));
+                if config.learnings.enabled {
+                    Arc::clone(&store).spawn_watcher(5);
+                }
+                store
+            })
             .build()
     }
 
@@ -386,6 +403,11 @@ impl Agent {
     }
 
     fn build_system_prompt_with_channel(&self, active_channel: Option<&str>) -> Result<String> {
+        // Take a snapshot of the current learnings so the prompt always
+        // reflects the latest state of the learnings store (which may have
+        // been updated by the background watcher or by an agent writing new
+        // LEARNING.toml files via `LearningsStore::write_learning`).
+        let learnings_snapshot = self.learnings.snapshot();
         let instructions = self.tool_dispatcher.prompt_instructions(&self.tools);
         let ctx = PromptContext {
             workspace_dir: &self.workspace_dir,
@@ -395,7 +417,7 @@ impl Agent {
             skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
-            learnings: &self.learnings,
+            learnings: &learnings_snapshot,
             active_channel,
         };
         self.prompt_builder.build(&ctx)

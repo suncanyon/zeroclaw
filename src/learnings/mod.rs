@@ -52,8 +52,10 @@
 //! content = "Always link PRs and commits in replies — do not just say 'I updated file X'."
 //! ```
 
+mod store;
 mod types;
 
+pub use store::LearningsStore;
 pub use types::{Learning, LearningScope};
 use types::{LearningManifest, ScopeShorthand};
 
@@ -75,7 +77,7 @@ pub fn load_learnings(workspace_dir: &Path) -> Vec<Learning> {
     load_learnings_from_directory(&dir)
 }
 
-fn load_learnings_from_directory(learnings_dir: &Path) -> Vec<Learning> {
+pub(crate) fn load_learnings_from_directory(learnings_dir: &Path) -> Vec<Learning> {
     if !learnings_dir.exists() {
         return Vec::new();
     }
